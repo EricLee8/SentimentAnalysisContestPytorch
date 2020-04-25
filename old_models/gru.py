@@ -24,7 +24,7 @@ args = parser.parse_args()
 
 PRETRAINED_MODEL_NAME = "bert-base-chinese"
 PRETRAINED_MODEL_PATH = "chinese_roberta/" if not args.zhlarge else "chinese_roberta_large/"
-MODEL_NAME = 'textcnn_plus_wordavg.pth'
+MODEL_NAME = 'gru.pth'
 BATCH_SIZE = 64 if not args.zhlarge else 16
 SAMPLE_FRAC = 1
 NUM_LABELS = 3
@@ -32,14 +32,17 @@ EPOCHS = 2 if not args.zhlarge else 1
 MAX_SEQ_LENGTH = 128
 TRAIN_RATE = 0.9
 DEV_NUM = 1
-VALID_INTERVAL = 100 if not args.zhlarge else 200
+VALID_INTERVAL = 100 if not args.zhlarge else 600
 
 if args.small:
     BATCH_SIZE = 32
 
-
-puncs = ['?', '展开全文c']
-
+# puncs = ['【','】',')','(','、','，','“','”',
+#          '。','《','》',' ','-','！','？','.',
+#          '\'','[',']','：','/','.','"','\u3000',
+#          '’','．',',','…', ';','·','%','（','#',
+#          '）','；','>','<','$', ' ', ' ','\ufeff', ':', '?', '展开全文c'] 
+puncs = ['?', '展开全文c'] 
 
 def remove_puncs(text: str):
     if not isinstance(text, str):
@@ -49,17 +52,15 @@ def remove_puncs(text: str):
     return text
 
 
-class Bert_Plus_TextCNN_WordAvg(BertPreTrainedModel):
-    def __init__(self, config, filter_sizes=[1,2,3,4], num_filters=192):
+class Bert_GRU(BertPreTrainedModel):
+    def __init__(self, config, gru_hidden_size=768//2):
         super().__init__(config)
         self.num_labels = config.num_labels
-        self.convs = nn.ModuleList([
-            nn.Conv2d(1, out_channels=num_filters, kernel_size=(fs, config.hidden_size), stride=(1, 1)) for fs in filter_sizes
-        ])
         self.bert = BertModel(config)
-        self.dropout = nn.Dropout(0.1)
-        self.classifier = nn.Linear(len(filter_sizes)*num_filters, self.config.num_labels)
-        self.L2 = nn.Linear(config.hidden_size, self.config.num_labels)
+        self.gru = nn.GRU(config.hidden_size, gru_hidden_size, num_layers=2, batch_first=True, bidirectional=True)
+        self.dropout = nn.Dropout(0 if args.zhlarge else 0.1)
+        self.L_gru = nn.Linear(gru_hidden_size*2, self.config.num_labels)
+        self.L_avg = nn.Linear(config.hidden_size, self.num_labels)
         self.init_weights()
 
     def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, position_ids=None,
@@ -67,21 +68,20 @@ class Bert_Plus_TextCNN_WordAvg(BertPreTrainedModel):
     
         outputs = self.bert(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids,
             position_ids=position_ids, head_mask=head_mask, inputs_embeds=inputs_embeds)
-
         embedded = outputs[0] # (batch_size, sequence_length, hidden_size)
         
         # the wordAvg part
-        avg_pooled = F.avg_pool2d(embedded, (embedded.shape[1], 1)).squeeze(1)  # [batch size, hidden_size]
-        avg_logits = self.dropout(self.L2(avg_pooled))
+        # avg_pooled = F.avg_pool2d(embedded, (embedded.shape[1], 1)).squeeze(1)  # [batch size, hidden_size]
+        # avg_logits = self.dropout(self.L_avg(avg_pooled))
         
-        # textCNN part
-        embedded = embedded.unsqueeze(1) # (batch_size, 1, sequence_length, hidden_size), 1 is channels
-        conveds = [F.relu(conv(embedded).squeeze(3)) for conv in self.convs] # (batch_size, num_filters, seq_len-fs+1) for each element
-        pooled = [F.max_pool1d(conved, conved.shape[2]).squeeze(2) for conved in conveds] # pooled: (batch_size, num_filters)
-        catted = torch.cat(pooled, dim=1) # (batch_size, len(filter_sizes)*num_filters), default (B, 768(192*4))
-        cnn_logits = self.dropout(self.classifier(catted))
+        # gru part
+        gru_output, hn = self.gru(embedded) # (batch_size, seq_len, gru_hidden_size*2)
+        gru_pooled = F.avg_pool2d(gru_output, (gru_output.shape[1], 1)).squeeze(1)  # [batch size, gru_hidden_size*2]
+        gru_logits = self.L_gru(gru_pooled)
+        
+        # logits = avg_logits + gru_logits
+        logits = gru_logits
 
-        logits = avg_logits + cnn_logits
         outputs = (logits,) + outputs[2:]  # add hidden states and attention if they are here
 
         if labels is not None:
@@ -250,7 +250,7 @@ def gen_res(model, tokenizer):
     df_out['y'] = df_out.y.apply(lambda x: index_map[x])
     df_pred = pd.concat([df.loc[:, ["微博id"]],
                             df_out.loc[:, 'y']], axis=1)
-    df_pred.to_csv('CNNAvg-final.csv', index=False)
+    df_pred.to_csv('gru-final.csv', index=False)
 
 
 # 訓練模式
@@ -314,13 +314,12 @@ def train_model(model, trainloader, validloader, model_name=MODEL_NAME):
             torch.save(model.state_dict(), 'model_output/' + model_name)
 
 
-
 def main():
     tokenizer = BertTokenizer.from_pretrained(PRETRAINED_MODEL_NAME)
 
     # training
     df = pd.read_csv("data/nCoV_100k_train.labled.csv")
-    df = df.sample(frac=SAMPLE_FRAC, random_state=202004)
+    df = df.sample(frac=SAMPLE_FRAC, random_state=9527)
     # 去除不必要的欄位並重新命名兩標題的欄位名
     df = df.reset_index()
     if args.small:
@@ -338,7 +337,7 @@ def main():
     trainloader = DataLoader(trainset, batch_size=BATCH_SIZE)
     validset = SentimentDataset("valid", tokenizer=tokenizer,max_seq_length=MAX_SEQ_LENGTH, df_=df_valid)
     validloader = DataLoader(validset, batch_size=BATCH_SIZE)
-    model = Bert_Plus_TextCNN_WordAvg.from_pretrained(PRETRAINED_MODEL_PATH, num_labels=NUM_LABELS)
+    model = Bert_GRU.from_pretrained(PRETRAINED_MODEL_PATH, num_labels=NUM_LABELS)
     train_model(model, trainloader, validloader)
     # gen_res(model, tokenizer)
     del model
@@ -346,7 +345,7 @@ def main():
     
     if args.gen_res:
         # generating results from saved model
-        model = Bert_Plus_TextCNN_WordAvg.from_pretrained(PRETRAINED_MODEL_PATH, num_labels=NUM_LABELS)
+        model = Bert_GRU.from_pretrained(PRETRAINED_MODEL_PATH, num_labels=NUM_LABELS)
         print("loading state dict...")
         model.load_state_dict(torch.load('model_output/' + MODEL_NAME))
         print("starting to generate results...")

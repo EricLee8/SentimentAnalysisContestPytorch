@@ -24,7 +24,7 @@ args = parser.parse_args()
 
 PRETRAINED_MODEL_NAME = "bert-base-chinese"
 PRETRAINED_MODEL_PATH = "chinese_roberta/" if not args.zhlarge else "chinese_roberta_large/"
-MODEL_NAME = 'textcnn_plus_wordavg.pth'
+MODEL_NAME = 'word_avg_attention.pth'
 BATCH_SIZE = 64 if not args.zhlarge else 16
 SAMPLE_FRAC = 1
 NUM_LABELS = 3
@@ -32,14 +32,16 @@ EPOCHS = 2 if not args.zhlarge else 1
 MAX_SEQ_LENGTH = 128
 TRAIN_RATE = 0.9
 DEV_NUM = 1
-VALID_INTERVAL = 100 if not args.zhlarge else 200
+VALID_INTERVAL = 100 if not args.zhlarge else 400
 
 if args.small:
     BATCH_SIZE = 32
 
-
-puncs = ['?', '展开全文c']
-
+puncs = ['【','】',')','(','、','，','“','”',
+         '。','《','》',' ','-','！','？','.',
+         '\'','[',']','：','/','.','"','\u3000',
+         '’','．',',','…', ';','·','%','（','#',
+         '）','；','>','<','$', ' ', ' ','\ufeff', ':', '?', '展开全文c'] 
 
 def remove_puncs(text: str):
     if not isinstance(text, str):
@@ -49,39 +51,48 @@ def remove_puncs(text: str):
     return text
 
 
-class Bert_Plus_TextCNN_WordAvg(BertPreTrainedModel):
-    def __init__(self, config, filter_sizes=[1,2,3,4], num_filters=192):
+class WordAvg_Attention(BertPreTrainedModel):
+    def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
-        self.convs = nn.ModuleList([
-            nn.Conv2d(1, out_channels=num_filters, kernel_size=(fs, config.hidden_size), stride=(1, 1)) for fs in filter_sizes
-        ])
         self.bert = BertModel(config)
-        self.dropout = nn.Dropout(0.1)
-        self.classifier = nn.Linear(len(filter_sizes)*num_filters, self.config.num_labels)
-        self.L2 = nn.Linear(config.hidden_size, self.config.num_labels)
+        self.dropout = nn.Dropout(0 if args.zhlarge else 0.1)
+        self.L = nn.Linear(config.hidden_size, self.config.num_labels)
+        self.attention = nn.Linear(config.hidden_size, 1)
         self.init_weights()
+        self.tokenizer = BertTokenizer.from_pretrained(PRETRAINED_MODEL_NAME)
 
     def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, position_ids=None,
         head_mask=None, inputs_embeds=None, labels=None):
     
         outputs = self.bert(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids,
             position_ids=position_ids, head_mask=head_mask, inputs_embeds=inputs_embeds)
-
         embedded = outputs[0] # (batch_size, sequence_length, hidden_size)
+        real_lengths = attention_mask.sum(dim=1) # (batch_size,)
         
         # the wordAvg part
-        avg_pooled = F.avg_pool2d(embedded, (embedded.shape[1], 1)).squeeze(1)  # [batch size, hidden_size]
-        avg_logits = self.dropout(self.L2(avg_pooled))
-        
-        # textCNN part
-        embedded = embedded.unsqueeze(1) # (batch_size, 1, sequence_length, hidden_size), 1 is channels
-        conveds = [F.relu(conv(embedded).squeeze(3)) for conv in self.convs] # (batch_size, num_filters, seq_len-fs+1) for each element
-        pooled = [F.max_pool1d(conved, conved.shape[2]).squeeze(2) for conved in conveds] # pooled: (batch_size, num_filters)
-        catted = torch.cat(pooled, dim=1) # (batch_size, len(filter_sizes)*num_filters), default (B, 768(192*4))
-        cnn_logits = self.dropout(self.classifier(catted))
+        # avg_pooled = F.avg_pool2d(embedded, (embedded.shape[1], 1)).squeeze(1)  # [batch size, hidden_size]
+        # logits = self.dropout(self.L(avg_pooled))
 
-        logits = avg_logits + cnn_logits
+        # attention part
+        attention_score = self.attention(embedded).squeeze(2) # [batch_size, seq_len]
+        for idx, length in enumerate(real_lengths):
+            if length < MAX_SEQ_LENGTH:
+                attention_score.data[idx, length:MAX_SEQ_LENGTH] = -np.inf
+        attention_coeff = F.softmax(attention_score, dim=1).unsqueeze(2)
+        attention_pooled = torch.bmm(embedded.view(-1, embedded.shape[2], embedded.shape[1]), attention_coeff).squeeze() # [batch_size, hidden_size]
+        logits = self.dropout(self.L(attention_pooled))
+        # if random.random() < 0.03:
+        #     att = attention_coeff.squeeze()[1]
+        #     print(att)
+        #     top_indices = torch.topk(att, 5).indices
+        #     top_ids = torch.index_select(input_ids[1], 0, top_indices)
+        #     top_tokens = self.tokenizer.convert_ids_to_tokens(top_ids.tolist())
+        #     print(top_tokens)
+        #     tokens = self.tokenizer.convert_ids_to_tokens(input_ids[1].tolist())
+        #     text = "".join(tokens)
+        #     print(text)
+
         outputs = (logits,) + outputs[2:]  # add hidden states and attention if they are here
 
         if labels is not None:
@@ -183,7 +194,6 @@ class SentimentDataset(Dataset):
 
 
 def get_predictions(model, dataloader, compute_acc=False):
-    model.eval()
     predictions = None
     ground_labels = None
     correct = 0
@@ -223,7 +233,6 @@ def get_predictions(model, dataloader, compute_acc=False):
                 if compute_acc:
                     ground_labels = torch.cat((ground_labels, labels))
     print(get_time() + "Endding pred/valid...")
-    model.train()
     if compute_acc:
         f1 = compute_f1(predictions, ground_labels)
         acc = correct / total
@@ -250,7 +259,7 @@ def gen_res(model, tokenizer):
     df_out['y'] = df_out.y.apply(lambda x: index_map[x])
     df_pred = pd.concat([df.loc[:, ["微博id"]],
                             df_out.loc[:, 'y']], axis=1)
-    df_pred.to_csv('CNNAvg-final.csv', index=False)
+    df_pred.to_csv('Avg_with_attention-final.csv', index=False)
 
 
 # 訓練模式
@@ -261,8 +270,6 @@ def train_model(model, trainloader, validloader, model_name=MODEL_NAME):
     # 使用 Adam Optim 更新整個分類模型的參數
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
     best_f1 = 0.0
-    best_history_mean = 0.0
-    history = [0.0]*3
     for epoch in range(EPOCHS):
         running_loss = 0.0
         batch_num = 0
@@ -286,33 +293,24 @@ def train_model(model, trainloader, validloader, model_name=MODEL_NAME):
 
             if batch_num % VALID_INTERVAL == 0:
                 _, acc, f1 = get_predictions(model, validloader, compute_acc=True)
-                history.pop(0)
-                history.append(f1)
-                best_f1 = max(best_f1, f1)
-                history_mean = np.array(history).mean()
-                print('[epoch %d, batch %d] valid_acc: %.4f, valid_f1: %.4f, history_averaged: %.4f' %
-                    (epoch + 1,  batch_num, acc, f1, history_mean))
-                if history_mean >= best_history_mean-0.0001 and f1>=best_f1-0.007:
-                    print("Best history averaged f1: %.4f (previous: %.4f), saving model to disk..." % (history_mean, best_history_mean))
-                    best_history_mean = history_mean
+                print('[epoch %d, batch %d] valid_acc: %.3f, valid_f1: %.3f' %
+                    (epoch + 1,  batch_num, acc, f1))
+                if f1 >= best_f1 and args.gen_res:
+                    best_f1 = f1
+                    print("Best f1, saving model to disk...")
                     torch.save(model.state_dict(), 'model_output/' + model_name)
 
         # 計算分類準確率
         _, acc, f1 = get_predictions(model, trainloader, compute_acc=True)
-        print('[epoch %d] loss: %.4f, acc: %.4f, f1: %.4f' %
-            (epoch + 1, running_loss, acc, f1))
+        print('[epoch %d] loss: %.3f, acc: %.3f, f1: %.3f' %
+              (epoch + 1, running_loss, acc, f1))
         _, acc, f1 = get_predictions(model, validloader, compute_acc=True)
-        history.pop(0)
-        history.append(f1)
-        best_f1 = max(best_f1, f1)
-        history_mean = np.array(history).mean()
-        print('[epoch %d, batch %d] valid_acc: %.4f, valid_f1: %.4f, history_averaged: %.4f' %
-            (epoch + 1,  batch_num, acc, f1, history_mean))
-        if history_mean >= best_history_mean-0.0001 and f1>=best_f1-0.007:
-            print("Best history averaged f1: %.4f (previous: %.4f), saving model to disk..." % (history_mean, best_history_mean))
-            best_history_mean = history_mean
+        print('[epoch %d] valid_acc: %.3f, valid_f1: %.3f' %
+              (epoch + 1, acc, f1))
+        if f1 >= best_f1 and args.gen_res:
+            best_f1 = f1
+            print("Best f1, saving model to disk...")
             torch.save(model.state_dict(), 'model_output/' + model_name)
-
 
 
 def main():
@@ -320,7 +318,7 @@ def main():
 
     # training
     df = pd.read_csv("data/nCoV_100k_train.labled.csv")
-    df = df.sample(frac=SAMPLE_FRAC, random_state=202004)
+    df = df.sample(frac=SAMPLE_FRAC, random_state=9527)
     # 去除不必要的欄位並重新命名兩標題的欄位名
     df = df.reset_index()
     if args.small:
@@ -338,7 +336,7 @@ def main():
     trainloader = DataLoader(trainset, batch_size=BATCH_SIZE)
     validset = SentimentDataset("valid", tokenizer=tokenizer,max_seq_length=MAX_SEQ_LENGTH, df_=df_valid)
     validloader = DataLoader(validset, batch_size=BATCH_SIZE)
-    model = Bert_Plus_TextCNN_WordAvg.from_pretrained(PRETRAINED_MODEL_PATH, num_labels=NUM_LABELS)
+    model = WordAvg_Attention.from_pretrained(PRETRAINED_MODEL_PATH, num_labels=NUM_LABELS)
     train_model(model, trainloader, validloader)
     # gen_res(model, tokenizer)
     del model
@@ -346,7 +344,7 @@ def main():
     
     if args.gen_res:
         # generating results from saved model
-        model = Bert_Plus_TextCNN_WordAvg.from_pretrained(PRETRAINED_MODEL_PATH, num_labels=NUM_LABELS)
+        model = WordAvg_Attention.from_pretrained(PRETRAINED_MODEL_PATH, num_labels=NUM_LABELS)
         print("loading state dict...")
         model.load_state_dict(torch.load('model_output/' + MODEL_NAME))
         print("starting to generate results...")

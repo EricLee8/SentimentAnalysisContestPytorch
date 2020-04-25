@@ -32,10 +32,10 @@ EPOCHS = 2 if not args.zhlarge else 1
 MAX_SEQ_LENGTH = 128
 TRAIN_RATE = 0.9
 DEV_NUM = 1
-VALID_INTERVAL = 100 if not args.zhlarge else 400
+VALID_INTERVAL = 100 if not args.zhlarge else 200
 
 if args.small:
-    BATCH_SIZE = 32
+    BATCH_SIZE = 32 if not args.zhlarge else 8
 
 # puncs = ['【','】',')','(','、','，','“','”',
 #          '。','《','》',' ','-','！','？','.',

@@ -26,15 +26,15 @@ args = parser.parse_args()
 PRETRAINED_MODEL_NAME = "bert-base-chinese"
 PRETRAINED_MODEL_PATH = "chinese_roberta/" if not args.zhlarge else "chinese_roberta_large/"
 BATCH_SIZE = 64 if not args.zhlarge else 16
-EPOCHS = 2 if not args.zhlarge else 2
+EPOCHS = 2 if not args.zhlarge else 1
 SAMPLE_FRAC = 1
 NUM_LABELS = 3
 MAX_SEQ_LENGTH = 128
 TRAIN_RATE = 0.9
 FILTER_SIZES = [1, 2, 3, 4]
 DEV_NUM = 1
-K = 5
-VALID_INTERVAL = 100 if not args.zhlarge else 600
+K = 3
+VALID_INTERVAL = 100 if not args.zhlarge else 200
 
 if args.small:
     BATCH_SIZE = 32
@@ -66,7 +66,7 @@ class Bert_Plus_TextCNN(BertPreTrainedModel):
             nn.Conv2d(1, out_channels=num_filters, kernel_size=(fs, config.hidden_size), stride=(1, 1)) for fs in filter_sizes
         ])
         self.bert = BertModel(config)
-        self.dropout = nn.Dropout(0 if args.zhlarge else 0.1)
+        self.dropout = nn.Dropout(0.1)
         self.classifier = nn.Linear(len(filter_sizes)*num_filters*K, self.config.num_labels)
         self.L2 = nn.Linear(config.hidden_size, self.config.num_labels)
         self.init_weights()
@@ -89,8 +89,8 @@ class Bert_Plus_TextCNN(BertPreTrainedModel):
         conveds = [F.relu(conv(embedded).squeeze(3)) for conv in self.convs] # (batch_size, num_filters, seq_len-fs+1) for each element
         filteds = [conved*filter_masks[:, idx, :, :MAX_SEQ_LENGTH-self.filter_sizes[idx]+1].squeeze() for idx, conved in enumerate(conveds)] #(batch_size, num_filters, seq_len-fs+1) for each element
         pooled = [kmax_pooling(filted, dim=2, k=K).view(-1, self.num_filters*K) for filted in filteds] # pooled: (batch_size, num_filters*K)
-        catted = self.dropout(torch.cat(pooled, dim=1)) # (batch_size, len(filter_sizes)*num_filters*K), default (B, 768(192*4))
-        cnn_logits = self.classifier(catted)
+        catted = torch.cat(pooled, dim=1) # (batch_size, len(filter_sizes)*num_filters*K), default (B, 768(192*4))
+        cnn_logits = self.dropout(self.classifier(catted))
 
         logits = avg_logits + cnn_logits
         outputs = (logits,) + outputs[2:]  # add hidden states and attention if they are here

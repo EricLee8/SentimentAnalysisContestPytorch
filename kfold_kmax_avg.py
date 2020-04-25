@@ -5,6 +5,7 @@ from kmax_plus_avg import *
 
 label_map = {'-1': 0, '0': 1, '1': 2}
 index_map = {v: k for k, v in label_map.items()}
+model_name = 'kmax/kfold_tmp_kmax_' + ("large" if args.zhlarge else "small")
 
 def gen_res2(model, tokenizer):
     model = model.to("cuda:"+str(DEV_NUM))
@@ -43,6 +44,7 @@ kfold = KFold(n_splits=5, shuffle=True, random_state=2020)
 for fold_id, (trn_idx, val_idx) in enumerate(kfold.split(df)):
     train_fold = df.iloc[trn_idx]
     valid_fold = df.iloc[val_idx]
+    print("================================================== fold %d: Start training ==================================================" %(fold_id,))
     print(get_time() + ": 訓練樣本數：", len(train_fold))
     trainset = SentimentDataset("train", tokenizer=tokenizer, max_seq_length=MAX_SEQ_LENGTH, df_=train_fold)
     trainloader = DataLoader(trainset, batch_size=BATCH_SIZE)
@@ -50,12 +52,12 @@ for fold_id, (trn_idx, val_idx) in enumerate(kfold.split(df)):
     validloader = DataLoader(validset, batch_size=BATCH_SIZE)
 
     model = Bert_Plus_TextCNN.from_pretrained(PRETRAINED_MODEL_PATH, num_labels=NUM_LABELS)
-    train_model(model, trainloader, validloader, 'kfold_tmp_' + ("large" if args.zhlarge else "small"))
+    train_model(model, trainloader, validloader, model_name + str(fold_id))
     del model
     torch.cuda.empty_cache()
 
     model = Bert_Plus_TextCNN.from_pretrained(PRETRAINED_MODEL_PATH, num_labels=NUM_LABELS)
-    model.load_state_dict(torch.load('model_output/' + 'kfold_tmp_' + ("large" if args.zhlarge else "small")))
+    model.load_state_dict(torch.load('model_output/' + model_name + str(fold_id)))
     pred = gen_res2(model, tokenizer)
     predictions.append(pred)
     del model
@@ -75,4 +77,4 @@ df_out = pd.DataFrame({"y": voted_predictions})
 df_out['y'] = df_out.y.apply(lambda x: index_map[x])
 df_pred = pd.concat([df.loc[:, ["微博id"]], 
                             df_out.loc[:, 'y']], axis=1)
-df_pred.to_csv('kfold' + ("large" if args.zhlarge else "small") + '-final.csv', index=None)
+df_pred.to_csv('kfold_kmax_' + ("large" if args.zhlarge else "small") + '-final.csv', index=None)
